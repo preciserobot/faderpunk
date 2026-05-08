@@ -59,7 +59,7 @@ pub static CONFIG: Config<PARAMS> = Config::new(
 })
 .add_param(Param::Enum {
     name: "Button mode",
-    variants: &["Mute", "CC toggle", "CC momentary"],
+    variants: &["Mute", "CC toggle", "CC momentary", "CC switch"],
 })
 .add_param(Param::MidiChannel {
     name: "Button Channel",
@@ -233,7 +233,11 @@ pub async fn run(
     let latch_layer_glob = app.make_global(LatchLayer::Main);
 
     if muted_glob.get() {
-        leds.unset(0, Led::Button);
+        if button_mode == 3 {
+            leds.set(0, Led::Button, led_color, Brightness::Low);
+        } else {
+            leds.unset(0, Led::Button);
+        }
     } else {
         leds.set(0, Led::Button, led_color, Brightness::Mid);
     }
@@ -252,6 +256,7 @@ pub async fn run(
         let mut fad_val = 0;
         let mut out: u16 = 0;
         let mut last_out = 0;
+        let mut last_button_out = 0u32;
 
         loop {
             app.delay_millis(1).await;
@@ -289,10 +294,10 @@ pub async fn run(
             }
 
             // Calculate output values
-            let muted = if button_mode != 0 {
-                false
-            } else {
+            let muted = if button_mode == 0 || button_mode == 3 {
                 muted_glob.get()
+            } else {
+                false
             };
             let att_layer_value = storage.query(|s| s.att_saved);
             let val = if muted {
@@ -322,22 +327,31 @@ pub async fn run(
             out = slew_2(out, attenuated, 3, 10);
             jack.set_value(out);
 
-            let midi_out = if muted {
-                if bipolar {
-                    2047
-                } else {
-                    0
-                }
-            } else if !bipolar {
+            let fader_midi_val = if !bipolar {
                 attenuate(main_layer_value, att_layer_value)
             } else {
                 attenuate_bipolar(main_layer_value, att_layer_value)
+            };
+            let midi_out = if muted {
+                if bipolar { 2047 } else { 0 }
+            } else {
+                fader_midi_val
             };
             if last_out != (midi_out as u32 * 127) / 4095 {
                 midi.send_cc(midi_cc, midi_out).await;
                 i2c.send_fader_value(0, out, range);
             }
             last_out = (midi_out as u32 * 127) / 4095;
+
+            if button_mode == 3 {
+                let cue_active = muted_glob.get();
+                let button_val = if cue_active { fader_midi_val } else { 0 };
+                let button_val_7bit = (button_val as u32 * 127) / 4095;
+                if last_button_out != button_val_7bit {
+                    midi_button.send_cc(button_cc, button_val).await;
+                }
+                last_button_out = button_val_7bit;
+            }
 
             // Update LEDs
             match latch_active_layer {
@@ -411,7 +425,11 @@ pub async fn run(
                 muted_glob.set(muted);
 
                 if muted {
-                    leds.unset(0, Led::Button);
+                    if button_mode == 3 {
+                        leds.set(0, Led::Button, led_color, Brightness::Low);
+                    } else {
+                        leds.unset(0, Led::Button);
+                    }
                     if button_mode == 1 {
                         midi_button.send_cc(button_cc, 0).await;
                     }
