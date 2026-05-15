@@ -130,6 +130,7 @@ pub struct Storage {
     muted: bool,
     att_saved: u16,
     fad_val: u16,
+    cc_offset_step: u8,
 }
 
 impl Default for Storage {
@@ -138,11 +139,34 @@ impl Default for Storage {
             muted: false,
             att_saved: 4095,
             fad_val: 4095,
+            cc_offset_step: 0,
         }
     }
 }
 
 impl AppStorage for Storage {}
+
+fn effective_midi_cc(base: MidiCc, step: u8) -> MidiCc {
+    let base_u8 = base.as_u16() as u8;
+    let block_base: u8 = if base_u8 >= 64 { 64 } else { 0 };
+    let block_offset = base_u8 - block_base;
+    let new_offset = (block_offset + step * 16) % 64;
+    MidiCc::from(block_base + new_offset)
+}
+
+fn offset_led_indicator(base: MidiCc, effective: MidiCc, configured_color: Color) -> (Color, Brightness) {
+    let delta = effective.as_u16() as i16 - base.as_u16() as i16;
+    match delta {
+        0 => (configured_color, Brightness::Mid),
+        16 => (Color::Orange, Brightness::Low),
+        32 => (Color::Orange, Brightness::Mid),
+        48 => (Color::Orange, Brightness::High),
+        -16 => (Color::Blue, Brightness::Low),
+        -32 => (Color::Blue, Brightness::Mid),
+        -48 => (Color::Blue, Brightness::High),
+        _ => (configured_color, Brightness::Mid),
+    }
+}
 
 #[embassy_executor::task(pool_size = 16/CHANNELS)]
 pub async fn wrapper(app: App<CHANNELS>, exit_signal: &'static Signal<NoopRawMutex, bool>) {
@@ -232,6 +256,10 @@ pub async fn run(
     let muted_glob = app.make_global(storage.query(|s| s.muted));
     let latch_layer_glob = app.make_global(LatchLayer::Main);
 
+    if !save_state {
+        storage.modify(|s| s.cc_offset_step = 0);
+    }
+
     if muted_glob.get() {
         if button_mode == 3 {
             leds.set(0, Led::Button, led_color, Brightness::Low);
@@ -257,6 +285,7 @@ pub async fn run(
         let mut out: u16 = 0;
         let mut last_out = 0;
         let mut last_button_out = 0u32;
+        let mut last_cc_offset_step = storage.query(|s| s.cc_offset_step);
 
         loop {
             app.delay_millis(1).await;
@@ -327,6 +356,16 @@ pub async fn run(
             out = slew_2(out, attenuated, 3, 10);
             jack.set_value(out);
 
+            // Detect CC offset change and send zero to the old effective CC
+            let cc_offset_step = storage.query(|s| s.cc_offset_step);
+            if cc_offset_step != last_cc_offset_step {
+                let old_cc = effective_midi_cc(midi_cc, last_cc_offset_step);
+                midi.send_cc(old_cc, 0).await;
+                last_cc_offset_step = cc_offset_step;
+                last_out = u32::MAX; // force resend on new CC
+            }
+            let active_cc = effective_midi_cc(midi_cc, cc_offset_step);
+
             let fader_midi_val = if !bipolar {
                 attenuate(main_layer_value, att_layer_value)
             } else {
@@ -338,7 +377,7 @@ pub async fn run(
                 fader_midi_val
             };
             if last_out != (midi_out as u32 * 127) / 4095 {
-                midi.send_cc(midi_cc, midi_out).await;
+                midi.send_cc(active_cc, midi_out).await;
                 i2c.send_fader_value(0, out, range);
             }
             last_out = (midi_out as u32 * 127) / 4095;
@@ -396,26 +435,58 @@ pub async fn run(
                 }
                 LatchLayer::Third => {}
             }
+
+            // Button LED: offset indicator while shift held, mute state otherwise
+            // (mode 2 manages its own button LED via button_handler)
+            if button_mode != 2 {
+                if latch_active_layer == LatchLayer::Alt {
+                    let effective = effective_midi_cc(midi_cc, cc_offset_step);
+                    let (color, brightness) = offset_led_indicator(midi_cc, effective, led_color);
+                    leds.set(0, Led::Button, color, brightness);
+                } else {
+                    let is_muted = muted_glob.get();
+                    if is_muted {
+                        if button_mode == 3 {
+                            leds.set(0, Led::Button, led_color, Brightness::Low);
+                        } else {
+                            leds.unset(0, Led::Button);
+                        }
+                    } else {
+                        leds.set(0, Led::Button, led_color, Brightness::Mid);
+                    }
+                }
+            }
         }
     };
 
     let button_handler = async {
         loop {
-            if button_mode == 2 {
-                // Momentary mode: handle both press and release
-                buttons.wait_for_down(0).await;
+            buttons.wait_for_down(0).await;
+
+            if buttons.is_shift_pressed() {
+                // Shift + Function: cycle CC offset step, skipping any position
+                // where effective CC would equal button_cc
+                let current_step = storage.query(|s| s.cc_offset_step);
+                let mut new_step = (current_step + 1) % 4;
+                for _ in 0..3 {
+                    if effective_midi_cc(midi_cc, new_step) != button_cc {
+                        break;
+                    }
+                    new_step = (new_step + 1) % 4;
+                }
+                storage.modify_and_save(|s| s.cc_offset_step = new_step);
+                buttons.wait_for_up(0).await;
+            } else if button_mode == 2 {
+                // Momentary mode
                 leds.set(0, Led::Button, led_color, Brightness::Mid);
                 midi_button.send_cc(button_cc, 4095).await;
-
                 buttons.wait_for_up(0).await;
                 leds.unset(0, Led::Button);
                 midi_button.send_cc(button_cc, 0).await;
             } else {
-                // Mode 0 (Mute) or Mode 1 (CC toggle): toggle on configured edge
+                // Mode 0 (Mute), 1 (CC toggle), 3 (CC switch): toggle on configured edge
                 if on_release {
                     buttons.wait_for_up(0).await;
-                } else {
-                    buttons.wait_for_down(0).await;
                 }
 
                 let muted = storage.modify_and_save(|s| {
@@ -424,17 +495,12 @@ pub async fn run(
                 });
                 muted_glob.set(muted);
 
+                // LED is handled by main_loop; only send CC here if needed
                 if muted {
-                    if button_mode == 3 {
-                        leds.set(0, Led::Button, led_color, Brightness::Low);
-                    } else {
-                        leds.unset(0, Led::Button);
-                    }
                     if button_mode == 1 {
                         midi_button.send_cc(button_cc, 0).await;
                     }
                 } else {
-                    leds.set(0, Led::Button, led_color, Brightness::Mid);
                     if button_mode == 1 {
                         midi_button.send_cc(button_cc, 4095).await;
                     }
@@ -455,14 +521,12 @@ pub async fn run(
             match app.wait_for_scene_event().await {
                 SceneEvent::LoadScene(scene) => {
                     storage.load_from_scene(scene).await;
+                    if !save_state {
+                        storage.modify(|s| s.cc_offset_step = 0);
+                    }
                     if save_state {
                         let muted = storage.query(|s| s.muted);
                         muted_glob.set(muted);
-                        if muted {
-                            leds.unset(0, Led::Button);
-                        } else {
-                            leds.set(0, Led::Button, led_color, Brightness::Mid);
-                        }
                     }
                 }
                 SceneEvent::SaveScene(scene) => storage.save_to_scene(scene).await,
