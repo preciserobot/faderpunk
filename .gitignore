@@ -7,3 +7,6 @@
 # devenv
 .devenv/
 .devenv.flake.nix
+
+# mac stuff
+.DS_Store
